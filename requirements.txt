@@ -1,0 +1,11 @@
+pandas
+python-dotenv
+clickhouse-driver
+tenacity
+akshare
+qlib
+numpy
+lightgbm
+scikit-learn
+matplotlib
+tqdm
