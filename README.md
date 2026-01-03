@@ -1,77 +1,121 @@
-# Washout & Burst Strategy
+# Washout & Burst Strategy (A-Share)
 
-This is a quantitative trading system designed to capture the **"Washout and Rebound"** (or "Washout & Burst") pattern in the A-share market, a pattern often associated with "Smart Money" or "Hot Money" movements. The system utilizes **ClickHouse** for high-performance full-market data storage, **Microsoft Qlib** for efficient data loading and feature engineering, and **LightGBM** for training ranking models. Its primary goal is to identify stocks with high breakout probability.
+This is a quantitative trading system designed to capture the **"Washout and Rebound"** (or "Washout & Burst") pattern in the A-share market. By analyzing price-volume interactions, it identifies stocks undergoing a "washout" phase, where weak holders are shaken out and is often followed by a sharp "burst" driven by smart money.
 
-## Architecture
+## 1. Quantitative Methodology
 
-* **Data Source**: AkShare (East Money API)
-* **Data Storage**: ClickHouse (High-performance OLAP database)
-* **Quant Framework**: Microsoft Qlib (Data Loader, Factor Computation, Backtest Engine)
-* **Core Model**: LightGBM (GBDT Ranking Model)
-* **Strategy Logic**: TopK Dropout (Daily rotation holding the Top 5 stocks with the highest prediction scores)
+The core philosophy is to identify assets with specific "Price Action" and "Volume" characteristics. The mathematical formulation of the features and targets is defined as follows.
 
-## Requirements
+### 1.1 Feature Engineering (Factors)
 
-Ensure the following Python libraries are installed:
+We construct a multi-dimensional feature vector $X_t$ for each stock at day $t$ using **Microsoft Qlib** expressions.
 
-```bash
-pip install qlib clickhouse-driver pandas numpy lightgbm scikit-learn matplotlib akshare tqdm
-```
+#### **A. Price Action (Washout Signals)**
+We look for high amplitude and long lower shadows, indicating strong support or manipulation.
 
+* **Amplitude ($A_t$)**: Measures daily price intensity.
+    $$A_t = \frac{H_t - L_t}{C_{t-1}}$$
+* **Lower Shadow Ratio ($S_{low}$)**: Captures the "V-shape" intraday rebound.
+    $$S_{low} = \frac{\min(O_t, C_t) - L_t}{C_t}$$
 
-# Workflow
-Follow these steps to ingest data, train the model, and run the simulation.
+#### **B. Volume Dynamics (Liquidity)**
+Detecting volume shrinkage (washout) or anomalies.
 
-## 1. Data Ingestion
-Fetch full historical daily data for A-shares (Open, High, Low, Close, Volume, and Turnover Rate) from AkShare and persist it into ClickHouse.
+* **Turnover Ratio ($TR_{5d}$)**: Current activity relative to the weekly average.
+    $$TR_{5d} = \frac{\text{Turnover}_t}{\text{Mean}(\text{Turnover}, 5)}$$
+* **Volume Shrinkage ($V_{shrink}$)**: Identifies if selling pressure is exhausting.
+    $$V_{shrink} = \frac{V_t}{\text{Mean}(V, 20)}$$
 
-## 2. Data Conversion
-Extract the cleaned data from ClickHouse and convert it into the .bin binary format required by Qlib for efficient, high-speed processing.
+#### **C. Trend & Momentum**
+* **Volatility ($\sigma_{20d}$)**: Normalized standard deviation to find active stocks.
+    $$\sigma_{20d} = \frac{\text{Std}(C, 20)}{\text{Mean}(C, 20)}$$
+* **Momentum ($R_{20d}$)**: Monthly return to ensure the stock is in an active trend.
+    $$R_{20d} = \frac{C_t}{C_{t-20}} - 1$$
+* **Simplified RSI**: Probability of Up-days in the past 2 weeks.
+    $$RSI_{sim} = \frac{1}{14} \sum_{i=0}^{13} \mathbb{I}(C_{t-i} > O_{t-i})$$
 
-## 3. Model Training
+> Notation: $O,H,L,C,V$ represent Open, High, Low, Close, and Volume respectively. $\mathbb{I}$ is the indicator function.
 
-* **Train** the LightGBM model. The model utilizes specific factors such as Amplitude, Volume Shrinkage, Lower Shadow Ratio, and Turnover Rate.
+---
 
-* **Label**: T+1 Max Price Return / T+1 Close Price Return.
+### 1.2 Modeling & Labeling
 
-* **Loss Function**: MSE / Rank Loss (CSRankNorm).
+The strategy treats the prediction as a **Learning to Rank** problem.
 
-## 4. Backtest Simulation
-Run the trading simulation.
+* **Prediction Target ($Y$)**:
+    We use different labels for training (classification/ranking) and backtesting. The primary goal is to capture the **Intraday Burst**.
+    $$Y_{train} = \frac{H_{t+1}}{C_t} - 1 \quad (\text{Next Day Max Return})$$
 
-* **Period**: 2024.07 - 2025.12
+* **Binary Classification Target** (used in Research):
 
-* **Strategy**: Daily full-position rotation (Top 5 stocks).
+$$
+Y_{class} =
+\begin{cases}
+1, & \text{if } Y_{train} > 0.04 \\
+0, & \text{otherwise}
+\end{cases}
+$$
 
-* **Risk Control**: Automatically filters out "Limit-up at Open" (One-bar limit up) stocks that cannot be purchased.
+- **Model Architecture**:
+  - **Algorithm**: LightGBM (Gradient Boosting Decision Tree)
+  - **Loss Function**: Rank Loss (LambdaRank) or MSE with `CSRankNorm` (Cross-Sectional Rank Normalization).
+  - **Ranking**: $`\text{Score}_t = f_{\theta}(X_t)`$.
+    Stocks are ranked daily by $\text{Score}_t$, and the Top $K$ are selected.
 
-## 5. Visualization
-Generate an equity curve comparison chart to visualize the strategy's performance against the CSI 300 Benchmark.
+---
 
+## 2. Architecture & Workflow
 
-![Profit & Loss Curve](backtest/strategy_comparison.png)
+### System Stack
+| Component | Technology | Description |
+| :--- | :--- | :--- |
+| **Data Source** | `AkShare` | East Money API for daily OHLCV & Turnover. |
+| **Storage** | `ClickHouse` | High-performance OLAP database for full-market storage. |
+| **Framework** | `Microsoft Qlib` | Data pipeline, feature calculation, and backtesting engine. |
+| **Model** | `LightGBM` | GBDT model optimized for tabular financial data. |
 
-# Performance Results
-The following metrics are based on backtesting data from July 2024 to December 2025:
+### Pipeline
+1.  **Ingestion**: Fetch daily data via AkShare $\rightarrow$ ClickHouse.
+2.  **ETL**: ClickHouse $\rightarrow$ `.bin` (Qlib format).
+3.  **Training**: Train LightGBM to predict $Y_{train}$ using features $X_t$.
+4.  **Inference**: Generate daily scores for all stocks.
+5.  **Strategy**:
+    * **Select**: Top 5 stocks with highest scores.
+    * **Filter**: Exclude stocks with "Limit-up at Open".
+    * **Rotate**: Daily rebalancing (Hold 1 day).
 
-**Annualized Return**: 1284.47% (Benchmark during same period: 22.49%)
+---
 
-**Total Return**: 4493.12% (Benchmark during same period: 34.37%)
+## 3. Performance (Backtest)
 
-**Sharpe Ratio**: 4.6643 (Benchmark during same period: 1.1269)
+**Period**: 2024.07.01 - 2025.12.30
 
-**Max Drawdown**: -31.85% (Benchmark during same period: -15.66%)
+The strategy demonstrates significant alpha during bull markets (High Beta).
+
+| Metric | Strategy (Washout) | Benchmark (CSI 300) |
+| :--- | :--- | :--- |
+| **Annualized Return** | **1284.47%** | 22.49% |
+| **Total Return** | **4493.12%** | 34.37% |
+| **Sharpe Ratio** | **4.66** | 1.13 |
+| **Max Drawdown** | -31.85% | -15.66% |
+
+![Equity Curve](backtest/strategy_comparison.png)
+
 
 
 ## Analysis
+
 The current strategy behaves as a typical "High-Beta Bull Market Amplifier."
 
 **Pros**: It achieves astonishing excess returns when market sentiment is high, aggressively capturing upward momentum.
 
 **Cons**: It suffers massive drawdowns during market downturns due to a lack of defensive mechanisms. It is currently a high-risk, high-reward system.
 
+
 ## Future Investigation & Assessment
+
 Based on the deep attribution analysis, future development will focus on three core areas: Drawdown Control, Market Timing, and resolving Data Bias.
+
 
 **Risk Management & Timing**
 
@@ -80,6 +124,7 @@ The biggest risk currently is "stubbornly holding top performers," operating at 
   Market Regime Filter: Introduce the CSI 300 index as a market wind vane. If the index falls below the 20-day MA or MACD shows a death cross, the system will forcibly reduce positions or clear positions (go to cash).
 
   Stop-Loss Logic: Implement individual stock-level stop-loss mechanisms. If a single-day drop exceeds 5% or breaks key support, sell immediately intraday or at the next open.
+  
 
 **Model Robustness**
 
